@@ -1,0 +1,414 @@
+# Convolutional Vision Transformer (CvT)
+
+本节将深入探讨Convolutional Vision Transformer (CvT)，它是Vision Transformer (ViT)[[1]](#vision-transformer)的一种变体，广泛应用于计算机视觉中的图像分类任务。
+
+## 回顾
+
+在深入研究CvT之前，让我们简要回顾前文介绍的ViT架构，以便更好地理解CvT架构。ViT将输入图像分割成固定长度的token序列（不重叠的图像块），然后应用多个标准Transformer层。这些层由多头自注意力机制和逐位置前馈网络(FFN)组成，从而为分类任务建模全局关系。
+
+## 概述
+
+卷积视觉Transformer (CvT)模型由Haiping Wu、Bin Xiao、Noel Codella、Mengchen Liu、Xiyang Dai、Lu Yuan和Lei Zhang在论文《CvT: Introducing Convolutions to Vision Transformers》[[2]](#cvt)中提出。CvT充分利用了CNN的优势，如_局部感受野_、_权重共享_和_空间下采样_，以及_平移不变性_、_尺度不变性_和_畸变不变性_，同时保留了Transformer的优点，如_动态注意力_、_全局上下文融合_和_更好的泛化能力_。与ViT相比，CvT在保持计算效率的同时，实现了卓越的性能。此外，由于卷积引入了内置的局部上下文结构，CvT不再需要位置嵌入(position embedding)，这使其在适应需要可变输入分辨率的各种视觉任务方面具有潜在优势。
+
+## 架构
+
+![CvT 架构](https://huggingface.co/datasets/hf-vision/course-assets/resolve/main/cvt_architecture.png)
+_(a) 总体架构，展示了通过卷积Token嵌入层实现的层级多阶段结构。(b) 卷积Transformer块的细节，其中包含作为第一层的卷积投影。[[2]](#cvt)_
+
+上面的CvT架构图展示了三阶段流程的主要步骤。CvT的核心是将两种基于卷积的操作融入到视觉Transformer架构中：
+
+- **卷积Token嵌入(Convolutional Token Embedding)**：将输入图像分割成重叠的图像块，将它们重塑为token，然后将它们输入到卷积层。这减少了token的数量（类似于下采样图像中的像素），同时增强了它们的特征丰富性，类似于传统的CNN。与其他Transformer不同，本模型跳过了向token添加预定义位置信息(position information)的步骤，而是完全依靠卷积运算来捕获空间关系。
+
+![投影层](https://huggingface.co/datasets/hf-vision/course-assets/resolve/main/cvt_conv_proj.png)
+_(a) ViT中的线性投影。(b) 卷积投影。(c) 挤压卷积投影(CvT中的默认设置)。[[2]](#cvt)_
+
+- **卷积Transformer块(Convolutional Transformer Blocks)**：CvT中的每个阶段都包含这些块的堆栈。CvT使用深度可分离卷积（卷积投影(Convolutional Projection)）来处理自注意力模块的“query”、“key”和“value”分量，而不是像ViT中那样使用通常的线性投影，如上图所示。这既保持了Transformer的优点，又提高了效率。“分类token(classification token)”（用于最终预测）仅在最后阶段才添加。最后，一个标准的全连接层被用来分析最终的分类token以预测图像类别。
+
+### CvT架构与其他视觉Transformer的比较
+
+下表显示了上述具有代表性的并行工作与CvT之间，在位置编码(positional encodings)的必要性、token嵌入类型、投影类型和backbone中的Transformer结构等方面的差异。
+
+| 模型                                            | 需要位置编码(PE)吗 | Token嵌入                 | 注意力投影     | 分层Transformer |
+| ------------------------------------------------ | ------------------ | ----------------------- | ------------ | --------------- |
+| ViT[[1]](#vision-transformer), DeiT [[3]](#deit) | 是                 | 非重叠                    | 线性           | 否             |
+| CPVT[[4]](#cpvt)                                 | 否 (使用PE生成器)    | 非重叠                    | 线性           | 否             |
+| TNT[[5]](#tnt)                                   | 是                 | 非重叠 (图像块+像素)        | 线性           | 否             |
+| T2T[[6]](#t2t)                                   | 是                 | 重叠 (连接)               | 线性           | 部分 (Token化)    |
+| PVT[[7]](#pvt)                                   | 是                 | 非重叠                    | 空间缩减       | 是             |
+| _CvT_[[2]](#cvt)                                 | _否_                | _重叠 (卷积)_            | _卷积_         | _是_            |
+
+### 主要亮点
+
+CvT能够实现卓越性能和计算效率的四个主要亮点如下：
+
+- 包含新的**卷积token嵌入(Convolutional token embedding)**的**Transformer层级结构(Hierarchy of Transformers)**。
+- 利用**卷积投影(Convolutional Projection)**的卷积Transformer块(Convolutional Transformer block)。
+- 由于卷积引入了内置的局部上下文结构，因此**无需位置编码(Positional Encoding)**。
+- 与其他视觉transformer架构相比，具有更少的**参数量**和更低的**FLOPs**(每秒浮点运算次数)。
+
+## PyTorch实现
+
+是时候进行实践操作了！让我们探索如何在PyTorch中编写CvT架构的每个主要模块的代码，如下面的官方实现所示[[8]](#cvt-imp)。
+
+1. 导入所需的库
+
+```python
+from collections import OrderedDict
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+from einops.layers.torch import Rearrange
+```
+
+2. **卷积投影(Convolutional Projection)**的实现
+
+```python
+def _build_projection(self, dim_in, dim_out, kernel_size, padding, stride, method):
+    if method == "dw_bn":
+        proj = nn.Sequential(
+            OrderedDict(
+                [
+                    (
+                        "conv",
+                        nn.Conv2d(
+                            dim_in,
+                            dim_in,
+                            kernel_size=kernel_size,
+                            padding=padding,
+                            stride=stride,
+                            bias=False,
+                            groups=dim_in,
+                        ),
+                    ),
+                    ("bn", nn.BatchNorm2d(dim_in)),
+                    ("rearrage", Rearrange("b c h w -> b (h w) c")),
+                ]
+            )
+        )
+    elif method == "avg":
+        proj = nn.Sequential(
+            OrderedDict(
+                [
+                    (
+                        "avg",
+                        nn.AvgPool2d(
+                            kernel_size=kernel_size,
+                            padding=padding,
+                            stride=stride,
+                            ceil_mode=True,
+                        ),
+                    ),
+                    ("rearrage", Rearrange("b c h w -> b (h w) c")),
+                ]
+            )
+        )
+    elif method == "linear":
+        proj = None
+    else:
+        raise ValueError("Unknown method ({})".format(method))
+
+    return proj
+```
+
+该方法接受与卷积层相关的多个参数（例如输入和输出维度、卷积核大小、padding、步长和方法），并返回基于指定方法的投影块。
+
+- 如果方法是`dw_bn`（带有批标准化的深度可分离卷积），它将创建一个Sequential块，该块由深度可分离卷积层、批归一化层和维度重排组成。
+
+- 如果方法是`avg`（平均池化），它将创建一个Sequential块，该块包含一个平均池化层，后跟维度重排。
+
+- 如果方法是`linear`，则返回None，表示不应用任何投影。
+
+维度重排是使用`Rearrange`操作执行的，该操作会重塑输入张量。然后返回生成的投影块。
+
+3. **卷积Token嵌入(Convolutional Token Embedding)**的实现
+
+```python
+class ConvEmbed(nn.Module):
+    def __init__(
+        self, patch_size=7, in_chans=3, embed_dim=64, stride=4, padding=2, norm_layer=None
+    ):
+        super().__init__()
+        patch_size = to_2tuple(patch_size)
+        self.patch_size = patch_size
+
+        self.proj = nn.Conv2d(
+            in_chans, embed_dim, kernel_size=patch_size, stride=stride, padding=padding
+        )
+        self.norm = norm_layer(embed_dim) if norm_layer else None
+
+    def forward(self, x):
+        x = self.proj(x)
+
+        B, C, H, W = x.shape
+        x = rearrange(x, "b c h w -> b (h w) c")
+        if self.norm:
+            x = self.norm(x)
+        x = rearrange(x, "b (h w) c -> b c h w", h=H, w=W)
+
+        return x
+```
+
+此代码定义了一个ConvEmbed模块，该模块对输入图像执行patch-wise嵌入。
+
+- `__init__`方法使用参数初始化模块，例如`patch_size`（图像块的大小）、`in_chans`（输入通道的数量）、`embed_dim`（嵌入图像块的维度）、`stride`（卷积运算的步长）、`padding`（卷积运算的padding）和`norm_layer`（标准化层，可选）。
+
+- 在构造函数中，使用指定的参数创建一个2D卷积层（`nn.Conv2d`），包括图像块大小、输入通道、嵌入维度、步长和padding。此卷积层被分配给`self.proj`。
+
+- 如果提供了标准化层，则会使用embed_dim通道创建一个标准化层的实例，并将其分配给`self.norm`。
+
+- forward方法接受一个输入张量x，并使用`self.proj`应用卷积运算。使用重排函数重塑输出以展平空间维度。如果存在标准化层，则将其应用于展平的表示。最后，将张量重塑回原始空间维度并返回。
+
+ConvEmbed模块专为图像的patch-wise嵌入而设计，其中每个图像块都通过卷积层独立处理，并且可选地将标准化应用于嵌入的特征。
+
+4. **视觉Transformer(Vision Transformer)**块的实现
+
+```python
+class VisionTransformer(nn.Module):
+    """Vision Transformer with support for patch or hybrid CNN input stage"""
+
+    def __init__(
+        self,
+        patch_size=16,
+        patch_stride=16,
+        patch_padding=0,
+        in_chans=3,
+        embed_dim=768,
+        depth=12,
+        num_heads=12,
+        mlp_ratio=4.0,
+        qkv_bias=False,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.0,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+        init="trunc_norm",
+        **kwargs,
+    ):
+        super().__init__()
+        self.num_features = self.embed_dim = embed_dim
+
+        self.rearrage = None
+
+        self.patch_embed = ConvEmbed(
+            patch_size=patch_size,
+            in_chans=in_chans,
+            stride=patch_stride,
+            padding=patch_padding,
+            embed_dim=embed_dim,
+            norm_layer=norm_layer,
+        )
+
+        with_cls_token = kwargs["with_cls_token"]
+        if with_cls_token:
+            self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
+        else:
+            self.cls_token = None
+
+        self.pos_drop = nn.Dropout(p=drop_rate)
+        dpr = [
+            x.item() for x in torch.linspace(0, drop_path_rate, depth)
+        ]  # stochastic depth decay rule
+
+        blocks = []
+        for j in range(depth):
+            blocks.append(
+                Block(
+                    dim_in=embed_dim,
+                    dim_out=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    drop=drop_rate,
+                    attn_drop=attn_drop_rate,
+                    drop_path=dpr[j],
+                    act_layer=act_layer,
+                    norm_layer=norm_layer,
+                    **kwargs,
+                )
+            )
+        self.blocks = nn.ModuleList(blocks)
+
+        if self.cls_token is not None:
+            trunc_normal_(self.cls_token, std=0.02)
+
+        if init == "xavier":
+            self.apply(self._init_weights_xavier)
+        else:
+            self.apply(self._init_weights_trunc_normal)
+
+    def forward(self, x):
+        x = self.patch_embed(x)
+        B, C, H, W = x.size()
+
+        x = rearrange(x, "b c h w -> b (h w) c")
+
+        cls_tokens = None
+        if self.cls_token is not None:
+            cls_tokens = self.cls_token.expand(B, -1, -1)
+            x = torch.cat((cls_tokens, x), dim=1)
+
+        x = self.pos_drop(x)
+
+        for i, blk in enumerate(self.blocks):
+            x = blk(x, H, W)
+
+        if self.cls_token is not None:
+            cls_tokens, x = torch.split(x, [1, H * W], 1)
+        x = rearrange(x, "b (h w) c -> b c h w", h=H, w=W)
+
+        return x, cls_tokens
+```
+
+此代码定义了一个视觉Transformer模块。以下是代码的简要概述：
+
+- **初始化：** `VisionTransformer`类使用各种参数进行初始化，这些参数定义了模型架构，例如图像块大小、嵌入维度、层数、注意力头数、dropout率等。
+
+- **图像块嵌入(Patch Embedding)：** 该模型包括一个图像块嵌入层（`patch_embed`），该层通过将输入图像分成非重叠的图像块并使用卷积嵌入它们来处理输入图像。
+
+- **Transformer块(Transformer Blocks)：** 该模型由一堆transformer块（`Block`）组成。块的数量由深度参数决定。每个块都包含多头自注意力机制和一个前馈神经网络。
+
+- **分类Token(Classification Token)：** （可选）该模型可以包括一个可学习的分类token（`cls_token`），该token附加到输入序列。此token用于分类任务。
+
+- **随机深度(Stochastic Depth)：** 随机深度应用于transformer块，其中在训练期间跳过随机的块子集以改善正则化。这由`drop_path_rate`参数控制。
+
+- **权重初始化：** 模型权重使用截断正态分布（`trunc_norm`）或Xavier初始化（`xavier`）进行初始化。
+
+- **Forward方法：** forward方法通过图像块嵌入处理输入，重新排列维度，如果存在则添加分类token，应用dropout，然后通过transformer块堆栈传递数据。最后，输出被重新排列回原始形状，并且分类token（如果存在）在返回输出之前与序列的其余部分分离。
+
+5. 卷积视觉Transformer块（**Transformer层级结构(Hierarchy of Transformers)**）的实现
+
+```python
+class ConvolutionalVisionTransformer(nn.Module):
+    def __init__(
+        self,
+        in_chans=3,
+        num_classes=1000,
+        act_layer=nn.GELU,
+        norm_layer=nn.LayerNorm,
+        init="trunc_norm",
+        spec=None,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+
+        self.num_stages = spec["NUM_STAGES"]
+        for i in range(self.num_stages):
+            kwargs = {
+                "patch_size": spec["PATCH_SIZE"][i],
+                "patch_stride": spec["PATCH_STRIDE"][i],
+                "patch_padding": spec["PATCH_PADDING"][i],
+                "embed_dim": spec["DIM_EMBED"][i],
+                "depth": spec["DEPTH"][i],
+                "num_heads": spec["NUM_HEADS"][i],
+                "mlp_ratio": spec["MLP_RATIO"][i],
+                "qkv_bias": spec["QKV_BIAS"][i],
+                "drop_rate": spec["DROP_RATE"][i],
+                "attn_drop_rate": spec["ATTN_DROP_RATE"][i],
+                "drop_path_rate": spec["DROP_PATH_RATE"][i],
+                "with_cls_token": spec["CLS_TOKEN"][i],
+                "method": spec["QKV_PROJ_METHOD"][i],
+                "kernel_size": spec["KERNEL_QKV"][i],
+                "padding_q": spec["PADDING_Q"][i],
+                "padding_kv": spec["PADDING_KV"][i],
+                "stride_kv": spec["STRIDE_KV"][i],
+                "stride_q": spec["STRIDE_Q"][i],
+            }
+
+            stage = VisionTransformer(
+                in_chans=in_chans,
+                init=init,
+                act_layer=act_layer,
+                norm_layer=norm_layer,
+                **kwargs,
+            )
+            setattr(self, f"stage{i}", stage)
+
+            in_chans = spec["DIM_EMBED"][i]
+
+        dim_embed = spec["DIM_EMBED"][-1]
+        self.norm = norm_layer(dim_embed)
+        self.cls_token = spec["CLS_TOKEN"][-1]
+
+        # Classifier head
+        self.head = (
+            nn.Linear(dim_embed, num_classes) if num_classes > 0 else nn.Identity()
+        )
+        trunc_normal_(self.head.weight, std=0.02)
+
+    def forward_features(self, x):
+        for i in range(self.num_stages):
+            x, cls_tokens = getattr(self, f"stage{i}")(x)
+
+        if self.cls_token:
+            x = self.norm(cls_tokens)
+            x = torch.squeeze(x)
+        else:
+            x = rearrange(x, "b c h w -> b (h w) c")
+            x = self.norm(x)
+            x = torch.mean(x, dim=1)
+
+        return x
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        x = self.head(x)
+
+        return x
+```
+
+此代码定义了一个名为`ConvolutionalVisionTransformer`的PyTorch模块。
+
+- 该模型由多个阶段组成，每个阶段由`VisionTransformer`类的一个实例表示。
+- 每个阶段都有不同的配置，例如图像块大小、步长、深度、头数等，这些配置在spec字典中指定。
+- `forward_features`方法通过所有阶段处理输入x，并聚合最终表示。
+- 该类有一个分类器头，它执行线性变换以产生最终输出。
+- `forward`方法调用`forward_features`，然后将结果传递给分类器头。
+- 视觉transformer阶段按顺序命名为stage0、stage1等，每个阶段都是`VisionTransformer`类的一个实例，形成一个transformer层级结构。
+
+恭喜！现在您知道如何在PyTorch中实现CvT架构了。您可以在[此处](https://github.com/microsoft/CvT/blob/main/lib/models/cls_cvt.py)查看CvT架构的完整代码。
+
+## 尝试一下
+
+您可以使用Hugging Face `transformers`库来使用CvT，而无需深入了解其在PyTorch中的实现细节。方法如下：
+
+```bash
+pip install transformers
+```
+
+您可以在[此处](https://huggingface.co/docs/transformers/model_doc/cvt#overview)找到CvT模型的文档。
+
+### 用法
+
+以下是使用CvT模型将COCO 2017数据集的图像分类为1,000个ImageNet类中的一个的方法：
+
+```python
+from transformers import AutoFeatureExtractor, CvtForImageClassification
+from PIL import Image
+import requests
+
+url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+image = Image.open(requests.get(url, stream=True).raw)
+
+feature_extractor = AutoFeatureExtractor.from_pretrained("microsoft/cvt-13")
+model = CvtForImageClassification.from_pretrained("microsoft/cvt-13")
+
+inputs = feature_extractor(images=image, return_tensors="pt")
+outputs = model(**inputs)
+logits = outputs.logits
+# model predicts one of the 1000 ImageNet classes
+predicted_class_idx = logits.argmax(-1).item()
+print("Predicted class:", model.config.id2label[predicted_class_idx])
+```
+
+## 参考文献
+
+- [An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale](https://arxiv.org/abs/2010.11929) <a id="vision-transformer"></a>
+- [CvT: Introducing Convolutions to Vision Transformers](https://arxiv.org/abs/2103.15808) <a id="cvt"></a>
+- [Training data-efficient image transformers & distillation through attention](https://arxiv.org/abs/2012.12877) <a id="deit"></a>
+- [Conditional Positional Encodings for Vision Transformers](https://arxiv.org/abs/2102.10882) <a id="cpvt"></a>
+- [Transformer in Transformer](https://arxiv.org/abs/2103.00112v3)<a id="tnt"></a>
+- [Tokens-to-Token ViT: Training Vision Transformers from Scratch on ImageNet](https://arxiv.org/abs/2101.11986) <a id="t2t"></a>
+- [Pyramid Vision Transformer: A Versatile Backbone for Dense Prediction without Convolutions](https://arxiv.org/abs/2102.12122) <a id="pvt"></a>
+- [Implementation of CvT](https://github.com/microsoft/CvT/tree/main) <a id="cvt-imp"></a>
