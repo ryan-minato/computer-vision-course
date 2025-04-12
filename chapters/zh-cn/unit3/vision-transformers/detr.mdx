@@ -1,0 +1,202 @@
+# DEtection TRansformer (DETR)
+## 架构概述
+DETR主要用于目标检测任务，即识别图像中的物体。例如，输入模型的是道路图像，输出可能是`[('car',X1,Y1,W1,H1),('pedestrian',X2,Y2,W2,H2)]`，其中X、Y代表边界框左上角的x、y坐标，W、H分别代表框的宽度和高度。
+传统的目标检测模型，如YOLO，依赖于手工设计的特征，例如锚框先验，这需要对物体的位置和形状进行预先猜测，进而影响后续训练。此外，还需要使用后处理步骤来移除重叠的边界框，而这需要仔细调整其过滤策略。
+DEtection TRansformer，简称DETR，通过在特征提取骨干网络之后使用编码器-解码器Transformer直接并行预测边界框来简化检测器，从而最大限度地减少后处理。
+
+![DETR架构图](https://huggingface.co/datasets/hf-vision/course-assets/resolve/main/DETR.png)
+DETR的模型架构起始于一个CNN骨干网络，类似于其他基于图像的网络。其输出经过处理后被送入Transformer编码器，并产生N个嵌入向量(embeddings)。编码器的嵌入向量被添加到学习到的位置嵌入（称为对象查询）中，并在Transformer解码器中使用，用来生成另外N个嵌入向量。最后，每个N个嵌入向量都通过单独的前馈层来预测边界框的宽度、高度、坐标以及对象类别（或是否存在对象）。
+
+## 主要特点
+
+### 编码器-解码器
+与其他Transformer模型一样，Transformer编码器期望CNN骨干网络的输出是一个序列。因此，大小为`[dimension, height, width]`的特征图(feature map)会被调整尺寸，然后展平为`[dimension, less than height x width]`。
+![编码器的特征图](https://huggingface.co/datasets/hf-vision/course-assets/resolve/main/DETR_FeatureMaps.png)
+_**左图**: 可视化了特征图中256个维度中的12个维度。每个维度在缩小原始图像尺寸的同时，提取原始猫图像的部分特征。一些维度更关注猫身上的图案，另一些则更关注床单。_
+_**右图**: 保持原始特征维度大小为256不变，宽度和高度被进一步缩小，并展平为大小850。_
+由于Transformer具有置换不变性(permutation invariant)，因此位置嵌入被添加到编码器和解码器，以告知模型嵌入向量来自图像上的哪个位置。在编码器中，使用固定的位置编码(positional encodings)；而在解码器中，则使用学习到的位置编码（对象查询）。固定编码类似于原始Transformer论文中使用的编码，其中编码由不同特征维度上不同频率的正弦函数定义。这种编码方式无需学习任何参数即可提供位置感，并且依据的是图像上的位置索引。学习到的编码也基于位置索引，但每个位置都有一个单独的编码，该编码在整个训练过程中学习，以模型可理解的方式表示位置。
+
+### 基于集合的全局损失函数
+在YOLO等流行的目标检测模型中，损失函数包括边界框损失、物体损失（即感兴趣区域中存在对象的概率）和类别损失。损失是在每个网格单元的多个边界框上计算的，边界框的数量是固定的。另一方面，在DETR中，期望该架构以置换不变的方式生成唯一的边界框（即检测的顺序在输出中并不重要，并且边界框必须不同，不能全部相同）。因此，需要进行匹配以评估预测的质量。
+
+**二分匹配**
+二分匹配是一种计算ground truth边界框和预测框之间一对一匹配的方法。它旨在找到ground truth和预测边界框以及类别之间具有最高相似度的匹配。这确保了最接近的预测将与相应的ground truth匹配，以便正确调整损失函数中的框和类别。如果未进行匹配，则即使预测正确，未与ground truth顺序对齐的预测也会被标记为不正确。
+
+## 使用DETR检测对象
+要查看如何使用Hugging Face Transformers通过DETR执行推理的示例，请参见`DETR.ipynb`。
+
+## DETR的演变
+### Deformable DETR
+DETR的两个主要问题是收敛过程漫长而缓慢，以及小物体检测效果不佳。
+**可变形注意力**
+第一个问题通过使用可变形注意力(deformable attention)来解决，这减少了需要关注的采样点数量。由于全局注意力机制的计算复杂度较高，传统注意力机制的效率较低，并严重限制了图像的分辨率。该模型仅关注每个参考点周围固定数量的采样点，并且参考点由模型根据输入来学习。例如，在狗的图像中，参考点可能位于狗的中心，采样点则位于耳朵、嘴巴、尾巴等附近。
+
+**多尺度可变形注意力模块**
+第二个问题以类似于YOLOv3的方式解决，其中引入了多尺度特征图(multi-scale feature maps)。在卷积神经网络中，较早的层提取较小的细节（例如线条），而较后的层提取较大的细节（例如车轮、耳朵）。类似地，可变形注意力的不同层处理不同级别的分辨率。通过将来自编码器的某些层的输出连接到解码器，它允许模型检测多种尺寸的对象。
+
+### Conditional DETR
+Conditional DETR也旨在解决原始DETR中训练收敛缓慢的问题，从而使收敛速度提高了6.7倍以上。作者发现对象查询是通用的，并且不特定于输入图像。通过在解码器中使用**条件交叉注意力(Conditional Cross-Attention)**，查询可以更好地定位用于边界框回归的区域。
+![Deformable DETR的解码器层](https://huggingface.co/datasets/hf-vision/course-assets/resolve/main/DETR_DecoderLayer.png)
+_左图：DETR解码器层。右图：Deformable DETR解码器层_
+上图比较了原始DETR和Deformable DETR解码器层，主要区别在于交叉注意力块(cross-attention block)的查询输入。作者区分了内容查询c<sub>q</sub>（解码器自注意力输出）和空间查询p<sub>q</sub>。原始DETR只是将它们加在一起，而在Deformable DETR中，它们被连接在一起，其中c<sub>q</sub>关注对象的内容，而p<sub>q</sub>关注边界框区域。
+空间查询p<sub>q</sub>是解码器嵌入向量和对象查询投影到同一空间（分别变为T和p<sub>s</sub>）并相乘的结果。前几层的解码器嵌入向量包含边界框区域的信息，而对象查询包含每个边界框的学习参考点的信息。因此，它们的投影结合成一种表示形式，允许交叉注意力机制测量它们与编码器输入和正弦位置嵌入向量的相似性。这比仅使用对象查询和固定参考点的DETR更有效。
+
+## DETR推理
+
+您可以使用Hugging Face Hub上现有的DETR模型进行推理，如下所示：
+
+```python
+from transformers import DetrImageProcessor, DetrForObjectDetection
+import torch
+from PIL import Image
+import requests
+
+url = "http://images.cocodataset.org/val2017/000000039769.jpg"
+image = Image.open(requests.get(url, stream=True).raw)
+
+# 初始化模型
+processor = DetrImageProcessor.from_pretrained(
+    "facebook/detr-resnet-101", revision="no_timm"
+)
+model = DetrForObjectDetection.from_pretrained(
+    "facebook/detr-resnet-101", revision="no_timm"
+)
+
+# 预处理输入并推理
+inputs = processor(images=image, return_tensors="pt")
+outputs = model(**inputs)
+
+# 将输出（边界框和类别logits）转换为COCO API
+# 非极大值抑制(non max supression)阈值设为0.9
+target_sizes = torch.tensor([image.size[::-1]])
+results = processor.post_process_object_detection(
+    outputs, target_sizes=target_sizes, threshold=0.9
+)[0]
+
+for score, label, box in zip(results["scores"], results["labels"], results["boxes"]):
+    box = [round(i, 2) for i in box.tolist()]
+    print(
+        f"Detected {model.config.id2label[label.item()]} with confidence "
+        f"{round(score.item(), 3)} at location {box}"
+    )
+```
+
+输出如下：
+
+```bash
+Detected cat with confidence 0.998 at location [344.06, 24.85, 640.34, 373.74]
+Detected remote with confidence 0.997 at location [328.13, 75.93, 372.81, 187.66]
+Detected remote with confidence 0.997 at location [39.34, 70.13, 175.56, 118.78]
+Detected cat with confidence 0.998 at location [15.36, 51.75, 316.89, 471.16]
+Detected couch with confidence 0.995 at location [-0.19, 0.71, 639.73, 474.17]
+```
+
+## DETR的PyTorch实现
+原始论文中DETR的实现如下所示：
+```python
+import torch
+from torch import nn
+from torchvision.models import resnet50
+
+
+class DETR(nn.Module):
+    def __init__(
+        self, num_classes, hidden_dim, nheads, num_encoder_layers, num_decoder_layers
+    ):
+        super().__init__()
+        self.backbone = nn.Sequential(*list(resnet50(pretrained=True).children())[:-2])
+        self.conv = nn.Conv2d(2048, hidden_dim, 1)
+        self.transformer = nn.Transformer(
+            hidden_dim, nheads, num_encoder_layers, num_decoder_layers
+        )
+        self.linear_class = nn.Linear(hidden_dim, num_classes + 1)
+        self.linear_bbox = nn.Linear(hidden_dim, 4)
+        self.query_pos = nn.Parameter(torch.rand(100, hidden_dim))
+        self.row_embed = nn.Parameter(torch.rand(50, hidden_dim // 2))
+        self.col_embed = nn.Parameter(torch.rand(50, hidden_dim // 2))
+
+    def forward(self, inputs):
+        x = self.backbone(inputs)
+        h = self.conv(x)
+        H, W = h.shape[-2:]
+        pos = (
+            torch.cat(
+                [
+                    self.col_embed[:W].unsqueeze(0).repeat(H, 1, 1),
+                    self.row_embed[:H].unsqueeze(1).repeat(1, W, 1),
+                ],
+                dim=-1,
+            )
+            .flatten(0, 1)
+            .unsqueeze(1)
+        )
+        h = self.transformer(
+            pos + h.flatten(2).permute(2, 0, 1), self.query_pos.unsqueeze(1)
+        )
+        return self.linear_class(h), self.linear_bbox(h).sigmoid()
+```
+### 逐行分析`forward`函数：
+**骨干网络**
+输入图像首先通过ResNet骨干网络，然后通过卷积层，在这步维度会降低到`hidden_dim`。
+```python
+x = self.backbone(inputs)
+h = self.conv(x)
+```
+它们在`__init__`函数中被声明。
+```python
+self.backbone = nn.Sequential(*list(resnet50(pretrained=True).children())[:-2])
+self.conv = nn.Conv2d(2048, hidden_dim, 1)
+```
+
+**位置嵌入**
+
+虽然在论文中分别在编码器和解码器中使用了固定和训练的嵌入向量，但为了简单起见，作者在编码器和解码器中都使用了基于训练的嵌入向量。
+```python
+pos = (
+    torch.cat(
+        [
+            self.col_embed[:W].unsqueeze(0).repeat(H, 1, 1),
+            self.row_embed[:H].unsqueeze(1).repeat(1, W, 1),
+        ],
+        dim=-1,
+    )
+    .flatten(0, 1)
+    .unsqueeze(1)
+)
+```
+它们在此处声明为`nn.Parameter`。行和列嵌入向量的组合表示图像中的位置。
+```python
+self.row_embed = nn.Parameter(torch.rand(50, hidden_dim // 2))
+self.col_embed = nn.Parameter(torch.rand(50, hidden_dim // 2))
+```
+**调整大小**
+在输入Transformer之前，大小为`(batch size, hidden_dim, H, W)`的特征被重塑为`(hidden_dim, batch size, H*W)`，使其成为Transformer的序列输入。
+```python
+h.flatten(2).permute(2, 0, 1)
+```
+**Transformer**
+`nn.Transformer`函数将第一个参数作为编码器的输入，将第二个参数作为解码器的输入。如你所见，编码器接收调整大小后的特征并添加到位置嵌入向量中，而解码器接收`query_pos`，即解码器位置嵌入向量。
+```python
+h = self.transformer(pos + h.flatten(2).permute(2, 0, 1), self.query_pos.unsqueeze(1))
+```
+**前馈网络**
+最后，输出（大小为`(query_pos_dim, batch size, hidden_dim)`的张量）通过两个线性层馈送。
+```python
+return self.linear_class(h), self.linear_bbox(h).sigmoid()
+```
+第一个线性层预测类别，并为`No Object`类别添加了一个额外的类别。
+```python
+self.linear_class = nn.Linear(hidden_dim, num_classes + 1)
+```
+第二个线性层预测边界框，输出大小为4，分别对应xy坐标、高度和宽度。
+```python
+self.linear_bbox = nn.Linear(hidden_dim, 4)
+```
+
+## 参考文献
+- [DETR](https://arxiv.org/abs/2005.12872)
+- [YOLO](https://arxiv.org/abs/1506.02640)
+- [YOLOv3](https://arxiv.org/abs/1804.02767)
+- [Conditional DETR](https://arxiv.org/abs/2108.06152)
+- [Deformable DETR](https://arxiv.org/abs/2010.04159)
+- [facebook/detr-resnet-50](https://huggingface.co/facebook/detr-resnet-50)
